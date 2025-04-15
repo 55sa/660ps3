@@ -157,3 +157,9 @@ db::TupleDesc TupleDesc::merge(const TupleDesc &td1, const TupleDesc &td2) {
     }
     return {types, names};
 }
+
+type_t TupleDesc::field_type(size_t index) const {
+    // If you store your field types in a vector called `types`, for example:
+    return types.at(index);
+}
+

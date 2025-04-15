@@ -1,14 +1,14 @@
 #include <db/Query.hpp>
 #include <db/DbFile.hpp>
 #include <db/Tuple.hpp>
-#include <stdexcept>
-#include <vector>
-#include <string>
+
 #include <unordered_map>
+#include <string>
+#include <cmath>
 
 using namespace db;
 
-static bool evaluatePredicate(const Tuple &t, const FilterPredicate &p, const TupleDesc &td) {
+static bool evalFilter(const Tuple &t, const FilterPredicate &p, const TupleDesc &td) {
     size_t i = td.index_of(p.field_name);
     int tv = std::get<int>(t.get_field(i));
     int pv = std::get<int>(p.value);
@@ -23,107 +23,151 @@ static bool evaluatePredicate(const Tuple &t, const FilterPredicate &p, const Tu
     }
 }
 
-void db::projection(const DbFile &in, DbFile &out, const std::vector<std::string> &field_names) {
+void db::projection(const DbFile &in, DbFile &out, const std::vector<std::string> &fields) {
     for (Iterator it = in.begin(); it != in.end(); ++it) {
         Tuple t = *it;
-        std::vector<field_t> v;
-        for (auto &fn : field_names) {
-            size_t i = in.getTupleDesc().index_of(fn);
-            v.push_back(t.get_field(i));
+        std::vector<field_t> vals;
+        for (auto &f : fields) {
+            size_t idx = in.getTupleDesc().index_of(f);
+            vals.push_back(t.get_field(idx));
         }
-        out.insertTuple(Tuple(v));
+        out.insertTuple(Tuple(vals));
     }
 }
 
-void db::filter(const DbFile &in, DbFile &out, const std::vector<FilterPredicate> &pred) {
+void db::filter(const DbFile &in, DbFile &out, const std::vector<FilterPredicate> &preds) {
     const TupleDesc &td = in.getTupleDesc();
     for (Iterator it = in.begin(); it != in.end(); ++it) {
         Tuple t = *it;
-        bool ok = true;
-        for (auto &fp : pred) {
-            if (!evaluatePredicate(t, fp, td)) {
-                ok = false;
+        bool pass = true;
+        for (auto &p : preds) {
+            if (!evalFilter(t, p, td)) {
+                pass = false;
                 break;
             }
         }
-        if (ok) out.insertTuple(t);
+        if (pass) out.insertTuple(t);
     }
 }
 
-struct AggResult {
-    int count;
+struct AggRes {
     int sum;
     int minv;
     int maxv;
-    AggResult() : count(0), sum(0), minv(0), maxv(0) {}
+    int count;
+    AggRes() : sum(0), minv(0), maxv(0), count(0) {}
 };
 
 void db::aggregate(const DbFile &in, DbFile &out, const Aggregate &agg) {
     const TupleDesc &td = in.getTupleDesc();
-    size_t ai = td.index_of(agg.field);
-    bool g = agg.group.has_value();
-    size_t gi = 0;
-    if (g) gi = td.index_of(agg.group.value());
-    if (!g) {
-        AggResult r;
-        bool f = true;
+    size_t aggIdx = td.index_of(agg.field);
+    bool hasGroup = agg.group.has_value();
+    std::string gField;
+    if (hasGroup) gField = agg.group.value();
+
+    if (!hasGroup) {
+        AggRes r;
+        bool first = true;
         for (Iterator it = in.begin(); it != in.end(); ++it) {
             Tuple t = *it;
-            int v = std::get<int>(t.get_field(ai));
-            r.count++;
+            int v = std::get<int>(t.get_field(aggIdx));
             r.sum += v;
-            if (f) {
+            r.count++;
+            if (first) {
                 r.minv = v;
                 r.maxv = v;
-                f = false;
+                first = false;
             } else {
                 if (v < r.minv) r.minv = v;
                 if (v > r.maxv) r.maxv = v;
             }
         }
-        std::vector<field_t> vf;
+        std::vector<field_t> val;
         switch (agg.op) {
-            case AggregateOp::COUNT: vf.push_back(r.count); break;
-            case AggregateOp::SUM: vf.push_back(r.sum); break;
-            case AggregateOp::AVG: vf.push_back((r.count > 0) ? double(r.sum)/r.count : 0.0); break;
-            case AggregateOp::MIN: vf.push_back(r.minv); break;
-            case AggregateOp::MAX: vf.push_back(r.maxv); break;
-            default: throw std::logic_error("unsupported");
+            case AggregateOp::COUNT: val.push_back(r.count); break;
+            case AggregateOp::SUM:   val.push_back(r.sum);   break;
+            case AggregateOp::MIN:   val.push_back(r.minv);  break;
+            case AggregateOp::MAX:   val.push_back(r.maxv);  break;
+            case AggregateOp::AVG: {
+                double d = (r.count == 0) ? 0.0 : double(r.sum) / r.count;
+                val.push_back(d);
+                break;
+            }
         }
-        out.insertTuple(Tuple(vf));
+        out.insertTuple(Tuple(val));
     } else {
-        std::unordered_map<int, AggResult> m;
-        for (Iterator it = in.begin(); it != in.end(); ++it) {
-            Tuple t = *it;
-            int gv = std::get<int>(t.get_field(gi));
-            int v = std::get<int>(t.get_field(ai));
-            if (!m.count(gv)) {
-                AggResult ar;
-                ar.count = 1;
-                ar.sum = v;
-                ar.minv = v;
-                ar.maxv = v;
-                m[gv] = ar;
-            } else {
-                auto &ar = m[gv];
-                ar.count++;
-                ar.sum += v;
-                if (v < ar.minv) ar.minv = v;
-                if (v > ar.maxv) ar.maxv = v;
+        size_t groupIdx = td.index_of(gField);
+        type_t gtype = td.field_type(groupIdx);
+        if (gtype == type_t::INT) {
+            std::unordered_map<int, AggRes> m;
+            for (Iterator it = in.begin(); it != in.end(); ++it) {
+                Tuple t = *it;
+                int gv = std::get<int>(t.get_field(groupIdx));
+                int av = std::get<int>(t.get_field(aggIdx));
+                auto &r = m[gv];
+                if (r.count == 0) {
+                    r.minv = av;
+                    r.maxv = av;
+                } else {
+                    if (av < r.minv) r.minv = av;
+                    if (av > r.maxv) r.maxv = av;
+                }
+                r.sum += av;
+                r.count++;
             }
-        }
-        for (auto &p : m) {
-            std::vector<field_t> vf;
-            vf.push_back(p.first);
-            switch (agg.op) {
-                case AggregateOp::COUNT: vf.push_back(p.second.count); break;
-                case AggregateOp::SUM: vf.push_back(p.second.sum); break;
-                case AggregateOp::AVG: vf.push_back((p.second.count > 0) ? double(p.second.sum)/p.second.count : 0.0); break;
-                case AggregateOp::MIN: vf.push_back(p.second.minv); break;
-                case AggregateOp::MAX: vf.push_back(p.second.maxv); break;
-                default: throw std::logic_error("unsupported");
+            for (auto &kv : m) {
+                std::vector<field_t> row;
+                row.push_back(kv.first);
+                const AggRes &r = kv.second;
+                switch (agg.op) {
+                    case AggregateOp::COUNT: row.push_back(r.count); break;
+                    case AggregateOp::SUM:   row.push_back(r.sum);   break;
+                    case AggregateOp::MIN:   row.push_back(r.minv);  break;
+                    case AggregateOp::MAX:   row.push_back(r.maxv);  break;
+                    case AggregateOp::AVG: {
+                        double d = (r.count == 0) ? 0.0 : double(r.sum) / r.count;
+                        row.push_back(d);
+                        break;
+                    }
+                }
+                out.insertTuple(Tuple(row));
             }
-            out.insertTuple(Tuple(vf));
+        } else if (gtype == type_t::CHAR) {
+            std::unordered_map<std::string, AggRes> m;
+            for (Iterator it = in.begin(); it != in.end(); ++it) {
+                Tuple t = *it;
+                std::string gval = std::get<std::string>(t.get_field(groupIdx));
+                int av = std::get<int>(t.get_field(aggIdx));
+                auto &r = m[gval];
+                if (r.count == 0) {
+                    r.minv = av;
+                    r.maxv = av;
+                } else {
+                    if (av < r.minv) r.minv = av;
+                    if (av > r.maxv) r.maxv = av;
+                }
+                r.sum += av;
+                r.count++;
+            }
+            for (auto &kv : m) {
+                std::vector<field_t> row;
+                row.push_back(kv.first);
+                const AggRes &r = kv.second;
+                switch (agg.op) {
+                    case AggregateOp::COUNT: row.push_back(r.count); break;
+                    case AggregateOp::SUM:   row.push_back(r.sum);   break;
+                    case AggregateOp::MIN:   row.push_back(r.minv);  break;
+                    case AggregateOp::MAX:   row.push_back(r.maxv);  break;
+                    case AggregateOp::AVG: {
+                        double d = (r.count == 0) ? 0.0 : double(r.sum) / r.count;
+                        row.push_back(d);
+                        break;
+                    }
+                }
+                out.insertTuple(Tuple(row));
+            }
+        } else {
+            // handle double if needed
         }
     }
 }
@@ -143,20 +187,19 @@ void db::join(const DbFile &left, const DbFile &right, DbFile &out, const JoinPr
             switch (pred.op) {
                 case PredicateOp::EQ: match = (lv == rv); break;
                 case PredicateOp::NE: match = (lv != rv); break;
-                case PredicateOp::LT: match = (lv < rv); break;
+                case PredicateOp::LT: match = (lv < rv);  break;
                 case PredicateOp::LE: match = (lv <= rv); break;
-                case PredicateOp::GT: match = (lv > rv); break;
+                case PredicateOp::GT: match = (lv > rv);  break;
                 case PredicateOp::GE: match = (lv >= rv); break;
-                default: break;
             }
             if (match) {
-                std::vector<field_t> mf;
-                for (size_t i = 0; i < lt.size(); i++) mf.push_back(lt.get_field(i));
+                std::vector<field_t> merged;
+                for (size_t i = 0; i < lt.size(); i++) merged.push_back(lt.get_field(i));
                 for (size_t i = 0; i < rt.size(); i++) {
                     if (pred.op == PredicateOp::EQ && i == ri) continue;
-                    mf.push_back(rt.get_field(i));
+                    merged.push_back(rt.get_field(i));
                 }
-                out.insertTuple(Tuple(mf));
+                out.insertTuple(Tuple(merged));
             }
         }
     }

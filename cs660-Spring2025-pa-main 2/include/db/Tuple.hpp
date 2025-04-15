@@ -18,6 +18,8 @@ namespace db {
         size_t size() const;
 
         const field_t &get_field(size_t i) const;
+
+
     };
 
     class TupleDesc {
@@ -98,5 +100,9 @@ namespace db {
          * @return the merged TupleDesc
          */
         static db::TupleDesc merge(const TupleDesc &td1, const TupleDesc &td2);
+
+
+        type_t field_type(size_t index) const;
+
     };
 } // namespace db
